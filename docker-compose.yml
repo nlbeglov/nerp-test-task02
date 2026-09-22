@@ -1,0 +1,31 @@
+networks:
+  task02:
+    external: false
+
+services:
+  app:
+    image: ${IMAGE_REF}
+    restart: unless-stopped
+    environment:
+      - APP_VERSION=${APP_VERSION}
+    networks:
+      - task02
+
+  caddy:
+    image: caddy:2.11.4
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./configs/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - task02
+    depends_on:
+      - app
+
+volumes:
+  caddy_data:
+  caddy_config:

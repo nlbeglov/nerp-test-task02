@@ -73,7 +73,7 @@ def add():
         return jsonify(error="; ".join(errors)), 400
 
     # если оба параметра успешно распознаны - считаем сумму и отдаём результат
-    return jsonify(result=a + b)
+    return jsonify(result=a + b + 1)
 
 
 # точка входа для локального запуска (python src/app.py) -

@@ -1,0 +1,72 @@
+# Workflow отката на ранее опубликованный образ БЕЗ пересборки.
+#
+# Отличие от ci-cd.yml принципиальное: здесь нет job "build" вообще -
+# мы намеренно НЕ собираем ничего заново, а берём уже готовый,
+# ранее опубликованный образ по его digest. Это доказывает, что
+# откат - это операция "переключить указатель", а не "собрать заново".
+
+name: Rollback
+
+on:
+  # workflow_dispatch - специальный trigger для РУЧНОГО запуска.
+  # После пуша этого файла в main на вкладке Actions появится кнопка
+  # "Run workflow", где можно будет заполнить поля ниже
+  workflow_dispatch:
+    inputs:
+      image_digest:
+        description: "Digest образа для отката, например sha256:abcdef0123... (без 'ghcr.io/...@' - только сам digest)"
+        required: true
+        type: string
+      app_version:
+        description: "Метка версии для /version (например commit SHA версии A)"
+        required: true
+        type: string
+
+# та же группа concurrency, что и в основном пайплайне -
+# откат и обычный деплой не должны выполняться одновременно
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Rollback to specified digest
+        env:
+          # собираем полную ссылку на образ из введённого digest -
+          # github.repository_owner и github.event.repository.name
+          # дают owner/repo, чтобы не хардкодить имя репозитория
+          IMAGE_REF: ghcr.io/${{ github.repository }}@${{ github.event.inputs.image_digest }}
+          APP_VERSION: ${{ github.event.inputs.app_version }}
+          SSH_HOST: ${{ secrets.VPS_HOST }}
+          SSH_USER: ${{ secrets.VPS_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_KEY }}
+        # используем ТОТ ЖЕ скрипт деплоя, что и в основном пайплайне -
+        # с точки зрения сервера "откат" и "обычный деплой" -
+        # неотличимые операции: и там, и там серверу просто говорят
+        # "разверни вот этот image_ref"
+        run: bash scripts/ci-deploy.sh
+
+      - name: Verify rollback
+        env:
+          APP_DOMAIN: test0.politblocks.com
+          EXPECTED_VERSION: ${{ github.event.inputs.app_version }}
+        run: |
+          sleep 5
+          echo "Проверка /health:"
+          curl -sf "https://${APP_DOMAIN}/health"
+          echo ""
+          echo "Проверка /version (ожидается: $EXPECTED_VERSION):"
+          ACTUAL_VERSION=$(curl -sf "https://${APP_DOMAIN}/version" | grep -oP '"version"\s*:\s*"\K[^"]+')
+          echo "Получено: $ACTUAL_VERSION"
+          if [ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]; then
+            echo "ОШИБКА: версия после отката не совпадает с ожидаемой" >&2
+            exit 1
+          fi
+          echo "Проверка сложения (2+3):"
+          curl -sf "https://${APP_DOMAIN}/add?a=2&b=3"

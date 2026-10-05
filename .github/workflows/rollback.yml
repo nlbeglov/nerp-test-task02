@@ -36,6 +36,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Validate inputs
+        env:
+          INPUT_DIGEST: ${{ github.event.inputs.image_digest }}
+          INPUT_VERSION: ${{ github.event.inputs.app_version }}
+        run: |
+          # значения из формы попадают в .env и команды на VPS: формат проверяется до любых действий
+          [[ "$INPUT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "image_digest должен иметь вид sha256:<64 hex>" >&2; exit 1; }
+          [[ "$INPUT_VERSION" =~ ^[A-Za-z0-9._-]+$ ]] \
+            || { echo "app_version содержит недопустимые символы" >&2; exit 1; }
+
       - name: Rollback to specified digest
         env:
           # собираем полную ссылку на образ из введённого digest -
@@ -54,19 +65,36 @@ jobs:
 
       - name: Verify rollback
         env:
-          APP_DOMAIN: test0.politblocks.com
+          APP_DOMAIN: a2.fdghyt.com
           EXPECTED_VERSION: ${{ github.event.inputs.app_version }}
         run: |
-          sleep 5
+          # ждём запуска сервиса после перезапуска (до 2 минут)
+          for i in $(seq 1 12); do
+            if curl -sf --max-time 10 "https://${APP_DOMAIN}/health" > /dev/null; then
+              break
+            fi
+            echo "Сервис ещё не отвечает ($i/12), ждём 10 с..."
+            sleep 10
+          done
+
           echo "Проверка /health:"
-          curl -sf "https://${APP_DOMAIN}/health"
+          curl -sf --max-time 10 "https://${APP_DOMAIN}/health"
           echo ""
+
           echo "Проверка /version (ожидается: $EXPECTED_VERSION):"
-          ACTUAL_VERSION=$(curl -sf "https://${APP_DOMAIN}/version" | grep -oP '"version"\s*:\s*"\K[^"]+')
+          ACTUAL_VERSION=$(curl -sf --max-time 10 "https://${APP_DOMAIN}/version" \
+            | python3 -c 'import sys, json; print(json.load(sys.stdin)["version"])')
           echo "Получено: $ACTUAL_VERSION"
           if [ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]; then
             echo "ОШИБКА: версия после отката не совпадает с ожидаемой" >&2
             exit 1
           fi
+
           echo "Проверка сложения (2+3):"
-          curl -sf "https://${APP_DOMAIN}/add?a=2&b=3"
+          RESULT=$(curl -sf --max-time 10 "https://${APP_DOMAIN}/add?a=2&b=3" \
+            | python3 -c 'import sys, json; print(json.load(sys.stdin)["result"])')
+          echo "Получено: $RESULT"
+          if [ "$RESULT" != "5" ]; then
+            echo "ОШИБКА: сложение после отката работает неверно" >&2
+            exit 1
+          fi

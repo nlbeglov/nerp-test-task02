@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 
-# Скрипт запускается ВНУТРИ GitHub Actions runner
+# Скрипт запускается ВНУТРИ GitHub Actions runner.
 # Его задача - подключиться к VPS по SSH и сказать серверу
 # "разверни вот этот конкретный образ (по digest)".
 #
-# Ожидаемые переменные окружения (передаются из workflow ci-cd.yml):
-#   IMAGE_REF        - полная ссылка на образ
+# Ожидаемые переменные окружения (передаются из workflow ci-cd.yml / rollback.yml):
+#   IMAGE_REF        - полная ссылка на образ вида ghcr.io/owner/repo@sha256:<64 hex>
 #   APP_VERSION      - видимая версия (обычно = commit SHA)
 #   SSH_HOST         - адрес VPS
 #   SSH_USER         - пользователь для подключения
 #   SSH_PRIVATE_KEY  - содержимое приватного ключа (многострочная переменная)
+#   APP_DOMAIN       - домен сервиса (по умолчанию a2.fdghyt.com)
+#   SSH_KNOWN_HOSTS  - (необязательно) строка known_hosts для VPS; если не задана,
+#                      отпечаток сервера берётся через ssh-keyscan
 
 set -euo pipefail
 
@@ -19,85 +22,83 @@ set -euo pipefail
 : "${SSH_USER:?SSH_USER не задан}"
 : "${SSH_PRIVATE_KEY:?SSH_PRIVATE_KEY не задан}"
 
-# фиксированные настройки, специфичные именно для этого проекта -
-# сознательно не выношу в переменные окружения, чтобы не плодить
-# лишние секреты ради значений, которые и так не меняются
+# Значения попадают в .env на сервере и в команды на VPS, поэтому проверяем их формат заранее:
+# образ - только по digest, версия - только безопасные символы
+[[ "$IMAGE_REF" =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]] \
+    || { echo "IMAGE_REF должен иметь вид ghcr.io/owner/repo@sha256:<64 hex>, получено: $IMAGE_REF" >&2; exit 1; }
+[[ "$APP_VERSION" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || { echo "APP_VERSION содержит недопустимые символы" >&2; exit 1; }
+APP_DOMAIN="${APP_DOMAIN:-a2.fdghyt.com}"
+[[ "$APP_DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] \
+    || { echo "APP_DOMAIN содержит недопустимые символы" >&2; exit 1; }
+
+# фиксированные настройки, специфичные именно для этого проекта
 PROJECT_NAME="task02"
-PROJECT_DIR="/opt/task02-deploy"
+PROJECT_DIR="/opt/devops/task02"
+
+SSH_KEY_FILE="$(mktemp)"
+# приватный ключ не должен пережить скрипт ни при успехе, ни при ошибке
+trap 'rm -f "$SSH_KEY_FILE"' EXIT
 
 echo "[1/5] Готовим временный SSH-ключ"
-# mktemp создаёт файл с уникальным именем - чтобы параллельные запуски
-# (если вдруг concurrency не сработает) не затирали ключи друг друга
-SSH_KEY_FILE="$(mktemp)"
-# записываем содержимое приватного ключа из переменной окружения в файл -
-# именно файл, а не переменную, нужен команде ssh через флаг -i
-echo "$SSH_PRIVATE_KEY" > "$SSH_KEY_FILE"
+printf '%s\n' "$SSH_PRIVATE_KEY" > "$SSH_KEY_FILE"
 # приватный ключ ДОЛЖЕН иметь права 600, иначе ssh откажется его использовать
-# ("Permissions are too open")
 chmod 600 "$SSH_KEY_FILE"
 
 echo "[2/5] Добавляем VPS в known_hosts"
-# ssh-keyscan получает публичный отпечаток сервера заранее,
-# чтобы ssh не задавал интерактивный вопрос
-# "Are you sure you want to continue connecting (yes/no)?" -
-# в автоматическом CI отвечать на такой вопрос некому
 mkdir -p ~/.ssh
-ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+if [ -n "${SSH_KNOWN_HOSTS:-}" ]; then
+    # отпечаток сервера заранее сохранён в секретах: защита от подмены сервера
+    printf '%s\n' "$SSH_KNOWN_HOSTS" >> ~/.ssh/known_hosts
+else
+    # ssh-keyscan доверяет серверу при первом подключении; надёжнее хранить known_hosts в секрете
+    ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+fi
 
-# короткая функция-обёртка, чтобы не повторять одни и те же флаги ssh
-# в каждой команде ниже
 run_remote() {
     ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=yes "${SSH_USER}@${SSH_HOST}" "$@"
 }
 
-echo "[3/5] Создаём папку проекта на VPS (если её ещё нет)"
-# заодно создаём подпапку configs/ - именно туда docker-compose.yml
-# монтирует Caddyfile (см. "./configs/Caddyfile:/etc/caddy/Caddyfile:ro")
+echo "[3/5] Создаём папку проекта на VPS (если её ещё нет): на сервере та же раскладка configs/, что и в репозитории"
 run_remote "mkdir -p '$PROJECT_DIR/configs'"
 
-echo "[4/5] Копируем свежие конфиги (docker-compose.yml, Caddyfile)"
-# scp с тем же ключом и опциями, что и ssh выше
+echo "[4/5] Копируем свежий docker-compose.yml (HTTPS обслуживает общий Caddy сервера)"
 scp -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=yes \
-    docker-compose.yml \
-    "${SSH_USER}@${SSH_HOST}:${PROJECT_DIR}/docker-compose.yml"
-# кладём Caddyfile именно в подпапку configs/ на сервере - путь должен
-# совпадать с тем, что указан в volumes: docker-compose.yml
-scp -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=yes \
-    configs/Caddyfile \
-    "${SSH_USER}@${SSH_HOST}:${PROJECT_DIR}/configs/Caddyfile"
+    configs/docker-compose.yml \
+    "${SSH_USER}@${SSH_HOST}:${PROJECT_DIR}/configs/docker-compose.yml"
 
 echo "[5/5] Обновляем .env на сервере и перезапускаем сервис"
-# heredoc (<<EOF ... EOF), переданный в run_remote, выполняется как
-# единый bash-скрипт УЖЕ НА СТОРОНЕ VPS. Внутри heredoc переменные
-# IMAGE_REF/APP_VERSION/PROJECT_NAME подставляются ЗДЕСЬ, на runner'е
-# (потому что EOF без кавычек), поэтому на сервере окажутся их готовые
-# значения, а не сами имена переменных
-run_remote bash <<EOF
+# Аргументы передаются в удалённый скрипт через printf %q (экранирование для удалённой оболочки),
+# а сам скрипт читается из heredoc в кавычках: ничего не подставляется и не исполняется на runner'е
+REMOTE_ARGS="$(printf '%q ' "$PROJECT_NAME" "$PROJECT_DIR" "$IMAGE_REF" "$APP_VERSION" "$APP_DOMAIN")"
+run_remote "bash -s -- $REMOTE_ARGS" <<'REMOTE'
 set -euo pipefail
-cd "$PROJECT_DIR"
+PROJECT_NAME="$1"; PROJECT_DIR="$2"; IMAGE_REF="$3"; APP_VERSION="$4"; APP_DOMAIN="$5"
+cd "$PROJECT_DIR/configs"
 
-# перезаписываем .env целиком - так надёжнее, чем sed по частям:
-# исключается риск оставить старое значение, если формат файла
-# когда-то изменится
+# Сохраняем предыдущий успешный выпуск: .env.previous хранит прошлые IMAGE_REF/APP_VERSION,
+# по этому digest можно сделать откат (workflow Rollback)
+if [ -f .env ]; then
+    cp .env .env.previous
+fi
+
 cat > .env <<ENVEOF
-PROJECT_NAME=$PROJECT_NAME
+COMPOSE_PROJECT_NAME=$PROJECT_NAME
 IMAGE_REF=$IMAGE_REF
 APP_VERSION=$APP_VERSION
+DOMAIN=$APP_DOMAIN
 ENVEOF
 
-# затягиваем свежий образ по digest и перезапускаем только то,
-# что изменилось (docker compose сам понимает, что caddy не менялся,
-# и не перезапускает его без необходимости)
 docker compose -p "$PROJECT_NAME" pull app
 docker compose -p "$PROJECT_NAME" up -d
 
 echo "Текущее состояние контейнеров:"
 docker compose -p "$PROJECT_NAME" ps
-EOF
+
+# Журнал выпусков: время, версия, digest и digest предыдущего выпуска
+PREVIOUS_REF="$(grep -m1 '^IMAGE_REF=' .env.previous 2>/dev/null | cut -d= -f2- || true)"
+echo "$(date +%Y-%m-%dT%H:%M:%S%z) version=$APP_VERSION image=$IMAGE_REF previous=${PREVIOUS_REF:-none}" >> releases.log
+REMOTE
 
 echo ""
 echo "Деплой выполнен: $IMAGE_REF (версия: $APP_VERSION)"
-
-# подчищаем за собой временный файл с приватным ключом -
-# он не должен пережить этот job дольше необходимого
-rm -f "$SSH_KEY_FILE"

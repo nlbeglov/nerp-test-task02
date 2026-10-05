@@ -72,3 +72,15 @@ def test_add_float_parameter_returns_400(client):
     # который легко пропустить при небрежной валидации
     response = client.get("/add?a=3.5&b=1")
     assert response.status_code == 400
+
+
+def test_add_underscore_in_number_returns_400(client):
+    # "1_0" int() превращает в 10, но это не запись целого числа в обычном виде
+    response = client.get("/add?a=1_0&b=1")
+    assert response.status_code == 400
+
+
+def test_add_plus_sign_is_accepted(client):
+    response = client.get("/add?a=%2B2&b=3")
+    assert response.status_code == 200
+    assert response.get_json() == {"result": 5}

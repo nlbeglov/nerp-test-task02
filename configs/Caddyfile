@@ -1,3 +1,0 @@
-test0.politblocks.com {
-    reverse_proxy app:8000
-}

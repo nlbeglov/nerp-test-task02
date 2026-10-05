@@ -1,4 +1,9 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 .env
+.env.previous
+releases.log
+secrets/

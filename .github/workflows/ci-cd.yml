@@ -25,7 +25,7 @@ jobs:
           python-version: "3.12.3"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r configs/requirements.txt
 
       - name: Run tests
         run: python -m pytest tests/ -v
@@ -64,6 +64,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: configs/Dockerfile
           push: true
           # тегируем образ SHA коммита - так по тегу сразу видно,
           # из какого именно коммита он собран (требование задания:
@@ -71,6 +72,10 @@ jobs:
           tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
           build-args: |
             APP_VERSION=${{ github.sha }}
+          # метки OCI: образ можно связать с исходным коммитом, не запуская его
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
       - name: Compose full image reference with digest
         id: image_ref
@@ -87,8 +92,15 @@ jobs:
           echo "  commit:  ${{ github.sha }}"
           echo "  digest:  ${{ steps.push.outputs.digest }}"
           echo "  ref:     ${{ steps.image_ref.outputs.ref }}"
+          # то же в сводку прогона: готовая строка для таблицы "версия - commit - digest" в RESULT.md
+          {
+            echo "### Выпуск"
+            echo "| Версия | Commit | Digest |"
+            echo "|---|---|---|"
+            echo "| ${{ github.sha }} | ${{ github.sha }} | ${{ steps.push.outputs.digest }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-  # JOB 3: доставка на VPS (полный разбор в шаге 7 этого файла).
+  # JOB 3: доставка на VPS (полный разбор в README.md этого задания).
   deploy:
     needs: build
     runs-on: ubuntu-latest
@@ -113,12 +125,38 @@ jobs:
         env:
           # домен зафиксирован (тот же, что в Caddyfile) - вынесен
           # в переменную только для читаемости, не для гибкости
-          APP_DOMAIN: test0.politblocks.com
+          APP_DOMAIN: a2.fdghyt.com
+          # ожидаемая версия = commit, из которого собран развёрнутый образ
+          EXPECTED_VERSION: ${{ github.sha }}
         run: |
-          # даём Caddy/приложению пару секунд на перезапуск
-          sleep 30
+          # ждём, пока Caddy и приложение поднимутся после перезапуска (до 2 минут),
+          # вместо фиксированной паузы
+          for i in $(seq 1 12); do
+            if curl -sf --max-time 10 "https://${APP_DOMAIN}/health" > /dev/null; then
+              break
+            fi
+            echo "Сервис ещё не отвечает ($i/12), ждём 10 с..."
+            sleep 10
+          done
+
           echo "Проверка /health:"
-          curl -sf "https://${APP_DOMAIN}/health"
+          curl -sf --max-time 10 "https://${APP_DOMAIN}/health"
           echo ""
-          echo "Проверка /version:"
-          curl -sf "https://${APP_DOMAIN}/version"
+
+          echo "Проверка /version (ожидается: ${EXPECTED_VERSION}):"
+          ACTUAL_VERSION=$(curl -sf --max-time 10 "https://${APP_DOMAIN}/version" \
+            | python3 -c 'import sys, json; print(json.load(sys.stdin)["version"])')
+          echo "Получено: ${ACTUAL_VERSION}"
+          if [ "${ACTUAL_VERSION}" != "${EXPECTED_VERSION}" ]; then
+            echo "ОШИБКА: на VPS работает не та версия" >&2
+            exit 1
+          fi
+
+          echo "Проверка сложения (2+3):"
+          RESULT=$(curl -sf --max-time 10 "https://${APP_DOMAIN}/add?a=2&b=3" \
+            | python3 -c 'import sys, json; print(json.load(sys.stdin)["result"])')
+          echo "Получено: ${RESULT}"
+          if [ "${RESULT}" != "5" ]; then
+            echo "ОШИБКА: сложение работает неверно" >&2
+            exit 1
+          fi

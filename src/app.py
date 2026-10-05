@@ -8,9 +8,10 @@
 """
 
 import os
+import re
 from flask import Flask, jsonify, request
 
-# создаём приложение Flask 
+# создаём приложение Flask
 app = Flask(__name__)
 
 # версия сервиса не зашита в коде намертво, а читается из переменной
@@ -49,6 +50,11 @@ def parse_int_param(name):
     if raw_value is None:
         return None, f"parametr '{name}' is missing"
 
+    # строго: необязательный знак и ASCII-цифры. Встроенный int() принимает и "1_0" (= 10),
+    # и пробелы вокруг числа, а задание требует целые числа в обычной записи
+    if not re.fullmatch(r"[+-]?[0-9]+", raw_value, flags=re.ASCII):
+        return None, f"parametr '{name}' must be an integer, got: '{raw_value}'"
+
     try:
         # int("2") -> 2, но int("2.5") или int("abc") выбросят ValueError -
         # это ровно то поведение, которое нам нужно: "3.5" не целое число
@@ -73,7 +79,7 @@ def add():
         return jsonify(error="; ".join(errors)), 400
 
     # если оба параметра успешно распознаны - считаем сумму и отдаём результат
-    return jsonify(result=a + b + 1)
+    return jsonify(result=a + b)
 
 
 # точка входа для локального запуска (python src/app.py) -
